@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -20,6 +21,12 @@
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 #define A 55
+#define F (1 << 14)
+#define INT_PARA_FP(n)    ((n) * F)
+#define FP_PARA_INT(x)    ((x) / F)
+#define FP_ARRED(x)       ((x) >= 0 ? ((x) + F / 2) / F : ((x) - F / 2) / F)
+#define FP_MULT(x, y)     ((int) (((int64_t) (x)) * (y) / F))
+#define FP_DIV(x, y)      ((int) (((int64_t) (x)) * F / (y)))
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
@@ -71,6 +78,41 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+
+
+static int load_avg;
+
+static void
+calcular_prioridade (struct thread *t, void *aux UNUSED)
+{
+  int p = FP_PARA_INT (INT_PARA_FP (PRI_MAX) - t->recent_cpu / 4) - t->nice * 2;
+  if (p > PRI_MAX) p = PRI_MAX;
+  if (p < PRI_MIN) p = PRI_MIN;
+  t->priority = p;
+}
+
+static void
+calcular_recent_cpu (struct thread *t, void *aux UNUSED)
+{
+  int coef = FP_DIV (2 * load_avg, 2 * load_avg + INT_PARA_FP (1));
+  t->recent_cpu = FP_MULT (coef, t->recent_cpu) + INT_PARA_FP (t->nice);
+}
+
+static void
+calcular_load_avg (void)
+{
+  int prontas = list_size (&ready_list);
+  if (thread_current () != idle_thread)
+    prontas++;
+  load_avg = load_avg * 59 / 60 + INT_PARA_FP (prontas) / 60;
+}
+
+static bool
+prioridade_menor (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  return list_entry (a, struct thread, elem)->priority
+         < list_entry (b, struct thread, elem)->priority;
+}
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -134,6 +176,25 @@ thread_tick (void)
 #endif
   else
     kernel_ticks++;
+      if (thread_mlfqs)
+    {
+      int64_t agora = timer_ticks ();
+
+      if (t != idle_thread)                       /* todo tick: +1 de CPU para quem roda */
+        t->recent_cpu += INT_PARA_FP (1);
+
+      if (agora % TIMER_FREQ == 0)                /* a cada 1 segundo */
+        {
+          calcular_load_avg ();
+          thread_foreach (calcular_recent_cpu, NULL);
+        }
+
+      if (agora % 4 == 0)                         /* a cada 4 ticks */
+        {
+          thread_foreach (calcular_prioridade, NULL);
+          intr_yield_on_return ();
+        }
+    }
 
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
@@ -336,6 +397,8 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  if (thread_mlfqs)
+    return;
   thread_current ()->priority = new_priority;
 }
 
@@ -348,9 +411,11 @@ thread_get_priority (void)
 
 /* Sets the current thread's nice value to NICE. */
 void
-thread_set_nice (int nice UNUSED) 
+thread_set_nice (int nice) 
 {
-  /* Not yet implemented. */
+  thread_current ()->nice = nice;
+  calcular_prioridade (thread_current (), NULL);
+  thread_yield ();
 }
 
 /* Returns the current thread's nice value. */
@@ -358,7 +423,7 @@ int
 thread_get_nice (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
@@ -366,7 +431,7 @@ int
 thread_get_load_avg (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return FP_ARRED (load_avg * 100);
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
@@ -374,7 +439,7 @@ int
 thread_get_recent_cpu (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return FP_ARRED (thread_current ()->recent_cpu * 100);
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -463,6 +528,10 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->nice = running_thread ()->nice;                /* ← NOVO */
+  t->recent_cpu = running_thread ()->recent_cpu;    /* ← NOVO */
+  if (thread_mlfqs)                                 /* ← NOVO */
+    calcular_prioridade (t, NULL);                  /* ← NOVO */
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
@@ -493,8 +562,10 @@ next_thread_to_run (void)
 {
   if (list_empty (&ready_list))
     return idle_thread;
-  else
-    return list_entry (list_pop_front (&ready_list), struct thread, elem);
+
+  struct list_elem *e = list_max (&ready_list, prioridade_menor, NULL);
+  list_remove (e);
+  return list_entry (e, struct thread, elem);
 }
 
 /* Completes a thread switch by activating the new thread's page
